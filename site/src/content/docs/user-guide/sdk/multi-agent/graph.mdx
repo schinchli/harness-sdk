@@ -716,7 +716,7 @@ graph = builder.build()
 
 The Graph pattern is available in multiple SDKs. While the core concept is the same, there are behavioral differences.
 
-**Dependency resolution**: Python uses OR semantics, where a node fires when any single incoming edge from the completed batch is satisfied. TypeScript uses AND semantics, where a node runs only when all incoming edge sources are completed. This is more intuitive for join/diamond patterns where you want to wait for all inputs before proceeding.
+**Dependency resolution**: Python uses OR semantics, where a node fires when any single incoming edge from the completed batch is satisfied. TypeScript uses AND semantics, where a node runs only when all incoming edges have fired. Edges that can never fire, such as a branch of an either/or that was not taken or a loop back edge on a node's first visit, are not waited on. This is more intuitive for join/diamond patterns where you want to wait for all inputs before proceeding.
 
 **Scheduling**: Python executes in discrete batches, waiting for the entire batch to complete before scheduling the next set of nodes. TypeScript launches nodes individually as they become ready, up to `maxConcurrency`. This avoids artificial bottlenecks where a fast node waits for a slow sibling to finish before its dependents can start.
 
