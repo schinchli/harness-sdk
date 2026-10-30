@@ -119,8 +119,10 @@ export interface GraphOptions extends GraphConfig {
  * - Construction uses a declarative options object rather than a mutable GraphBuilder.
  *   Nodes and edges are passed directly to the constructor.
  * - Dependency resolution uses AND semantics: a node runs only when all incoming edges
- *   are satisfied. Python uses OR semantics, firing a node when any single incoming
- *   edge from the completed batch is satisfied.
+ *   are satisfied. Edges that can never fire (a branch not taken, or a back edge on a
+ *   node's first visit) are not waited on, and at least one edge must fire. Python uses
+ *   OR semantics, firing a node when any single incoming edge from the completed batch
+ *   is satisfied.
  * - Nodes are launched individually as they become ready (up to maxConcurrency). Python
  *   executes in discrete batches, waiting for the entire batch to complete before
  *   scheduling the next set of nodes.
@@ -150,6 +152,8 @@ export class Graph implements MultiAgent {
   private readonly _pluginRegistry: MultiAgentPluginRegistry
   private readonly _hookRegistry: HookRegistryImplementation
   private readonly _sources: Node[]
+  /** Edges that close a cycle. They gate re-visits, never a node's first run. */
+  private readonly _backEdges: ReadonlySet<Edge>
   /** Whether the topology can ever run two nodes in parallel. Gates per-node printer buffering. */
   private readonly _canRunConcurrently: boolean
   private readonly _tracer: Tracer
@@ -184,6 +188,7 @@ export class Graph implements MultiAgent {
     this.edges = this._resolveEdges(edges)
     this._sources = this._resolveSources(sources)
     this._validateSources()
+    this._backEdges = this._findBackEdges()
     this._canRunConcurrently = this._computeCanRunConcurrently()
 
     this.sessionManager = sessionManager
@@ -846,14 +851,64 @@ export class Graph implements MultiAgent {
   }
 
   /**
-   * Checks whether all incoming edges have completed sources with satisfied conditions.
+   * Checks whether a node can run: every incoming edge has fired or can never fire, and at least one fired.
    */
   private async _allDependenciesSatisfied(incoming: Edge[], state: MultiAgentState): Promise<boolean> {
+    let fired = false
     for (const edge of incoming) {
-      if (state.node(edge.source.id)?.status !== Status.COMPLETED) return false
-      if (!(await edge.handler(state))) return false
+      const edgeState = await this._edgeState(edge, state)
+      if (edgeState === 'waiting' || edgeState === 'blocked') return false
+      fired ||= edgeState === 'fired'
+    }
+    return fired
+  }
+
+  /**
+   * Classifies an edge: `fired` (source completed, handler true), `blocked` (source completed,
+   * handler false: a condition on the edge gates its target), `dead` (its source can never run
+   * or it is a back edge), or `waiting` (may still fire).
+   */
+  private async _edgeState(edge: Edge, state: MultiAgentState): Promise<'fired' | 'blocked' | 'dead' | 'waiting'> {
+    const status = state.node(edge.source.id)?.status
+    if (status === Status.COMPLETED) return (await edge.handler(state)) ? 'fired' : 'blocked'
+    if (this._backEdges.has(edge)) return 'dead'
+    if (status !== Status.PENDING) return 'waiting'
+    return (await this._isUnreachable(edge.source, state)) ? 'dead' : 'waiting'
+  }
+
+  /**
+   * A pending node is unreachable when it has incoming edges and none of them can fire.
+   */
+  private async _isUnreachable(node: Node, state: MultiAgentState): Promise<boolean> {
+    const incoming = this.edges.filter((edge) => edge.target.id === node.id)
+    if (incoming.length === 0 || this._sources.includes(node)) return false
+    for (const edge of incoming) {
+      const edgeState = await this._edgeState(edge, state)
+      if (edgeState === 'fired' || edgeState === 'waiting') return false
     }
     return true
+  }
+
+  /**
+   * Finds edges that point at a node still being visited in a depth-first walk, i.e. edges that close a cycle.
+   */
+  private _findBackEdges(): Set<Edge> {
+    const backEdges = new Set<Edge>()
+    const visits = new Map<string, 'active' | 'done'>()
+    for (const node of [...this._sources, ...this.nodes.values()]) {
+      this._visitForBackEdges(node, visits, backEdges)
+    }
+    return backEdges
+  }
+
+  private _visitForBackEdges(node: Node, visits: Map<string, 'active' | 'done'>, backEdges: Set<Edge>): void {
+    if (visits.has(node.id)) return
+    visits.set(node.id, 'active')
+    for (const edge of this.edges.filter((candidate) => candidate.source.id === node.id)) {
+      if (visits.get(edge.target.id) === 'active') backEdges.add(edge)
+      this._visitForBackEdges(edge.target, visits, backEdges)
+    }
+    visits.set(node.id, 'done')
   }
 
   private _checkSteps(state: MultiAgentState): void {
@@ -864,7 +919,7 @@ export class Graph implements MultiAgent {
 
   /**
    * Finds downstream nodes that are ready to execute after a node completes.
-   * A target is ready when all its incoming edge sources are COMPLETED and all edge handlers return true.
+   * A target is ready when every incoming edge has fired or can never fire, and at least one has fired.
    *
    * @param node - The node that just completed execution.
    * @param state - Current multi-agent execution state.
